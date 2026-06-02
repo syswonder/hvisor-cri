@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: zephyr-container
+  namespace: default
+spec:
+  automountServiceAccountToken: false
+  containers:
+  - name: zephyr-vm
+    image: hvisor-zephyr
+    command: ["sleep"]
+    args: ["infinity"]
+  nodeSelector:
+    kubernetes.io/hostname: nxp-agent

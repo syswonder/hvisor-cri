@@ -16,6 +16,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/httpstream"
+	httpstreamspdy "k8s.io/apimachinery/pkg/util/httpstream/spdy"
+	apiremotecommand "k8s.io/apimachinery/pkg/util/remotecommand"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -32,16 +36,20 @@ type OSConfig struct {
 var supportedImages = map[string]OSConfig{
 	"hvisor-linux": {
 		VirtioConfig: "/root/virtio_cfg.json",
-		ZoneConfig:   "/root/linux2.json",
+		ZoneConfig:   "/root/zone1-linux.json",
 		ZoneID:       "1",
 	},
 	"hvisor-ruxos": {
-		VirtioConfig: "/root/virtio_cfg.json",
+		VirtioConfig: "/root/virtio_cfg_ruxos.json",
 		ZoneConfig:   "/root/zone1-ruxos.json",
 		ZoneID:       "1",
 	},
+	"hvisor-zephyr": {
+		VirtioConfig: "/root/virtio_cfg_zephyr.json",
+		ZoneConfig:   "/root/zone1-zephyr.json",
+		ZoneID:       "1",
+	},
 }
-
 
 
 // Create VM
@@ -1217,15 +1225,16 @@ func startExecServer(runtimeService *SimpleRuntimeService) {
 	}
 }
 
-// handleExecStream handle Exec streaming requests
+// handleExecStream handles Exec streaming requests from kubelet (kubectl exec).
+// It supports SPDY upgrade and multiplexed streams for stdin/stdout/stderr/error.
 func (s *SimpleRuntimeService) handleExecStream(w http.ResponseWriter, r *http.Request) {
 	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	log.Printf("handleExecStream called")
-	log.Printf("   Method: %s", r.Method)
-	log.Printf("   Path: %s", r.URL.Path)
-	log.Printf("   Query: %s", r.URL.RawQuery)
-	log.Printf("   Headers: %v", r.Header)
-	log.Printf("   RemoteAddr: %s", r.RemoteAddr)
+	log.Printf("Method: %s", r.Method)
+	log.Printf("Path: %s", r.URL.Path)
+	log.Printf("Query: %s", r.URL.RawQuery)
+	log.Printf("Headers: %v", r.Header)
+	log.Printf("RemoteAddr: %s", r.RemoteAddr)
 
 	// extract container-id from URL
 	pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/hvisor/exec/"), "/")
@@ -1238,35 +1247,24 @@ func (s *SimpleRuntimeService) handleExecStream(w http.ResponseWriter, r *http.R
 	// check if container exists and is running
 	container, exists := s.containers[containerID]
 	if !exists {
-		log.Printf("Container not found: %s", containerID)
+		log.Printf("container not found: %s", containerID)
 		http.Error(w, "container not found", http.StatusNotFound)
 		return
 	}
 
 	if container.State != runtimeapi.ContainerState_CONTAINER_RUNNING {
-		log.Printf("Container is not running: state=%v", container.State)
+		log.Printf("container is not running: state=%v", container.State)
 		http.Error(w, "container is not running", http.StatusBadRequest)
 		return
 	}
 
 	// extract command from query parameters
-	cmdStr := r.URL.Query().Get("cmd")
-	log.Printf("   cmd from query: %q", cmdStr)
-	
-	// if query does not have cmd, try to get it from URL path or header
-	// kubelet may pass command in other ways
+	q := r.URL.Query()
+	cmdStr := q.Get("cmd")
+	if cmdStr == "" && len(pathParts) > 1 {
+		cmdStr = strings.Join(pathParts[1:], " ")
+	}
 	if cmdStr == "" {
-		// check if there is Upgrade header (SPDY upgrade request)
-		if upgrade := r.Header.Get("Upgrade"); upgrade != "" {
-			log.Printf("   Upgrade header: %s", upgrade)
-			// SPDY upgrade request, return 101 Switching Protocols
-			// but we don't support SPDY yet, return 400
-			log.Printf("SPDY upgrade not supported yet")
-			http.Error(w, "SPDY upgrade not supported", http.StatusBadRequest)
-			return
-		}
-		
-		log.Printf("No cmd parameter found, returning 400")
 		http.Error(w, "missing cmd parameter", http.StatusBadRequest)
 		return
 	}
@@ -1278,69 +1276,177 @@ func (s *SimpleRuntimeService) handleExecStream(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	log.Printf("   Container: %s", containerID)
-	log.Printf("   Command: %v", cmd)
+	log.Printf("Container: %s", containerID)
+	log.Printf("Command: %v", cmd)
 	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-	// start helper --stream mode
-	helperPath := os.Getenv("HVISOR_EXEC_HELPER_PATH")
-	if helperPath == "" {
-		helperPath = "/root/hvisor-exec-helper"
+	// SPDY upgrade branch for kubectl exec.
+	if httpstream.IsUpgradeRequest(r) {
+		log.Printf("Upgrade request detected, starting SPDY exec")
+
+		// 1. negotiate stream protocol version
+		negotiatedProtocol, err := httpstream.Handshake(r, w, apiremotecommand.SupportedStreamingProtocols)
+		if err != nil {
+			log.Printf("SPDY handshake failed: %v", err)
+			return
+		}
+		log.Printf("SPDY negotiated protocol: %s", negotiatedProtocol)
+
+		// 2. collect streams created by kubelet (stdin/stdout/stderr/error/resize)
+		type streamSet struct {
+			stdin  httpstream.Stream
+			stdout httpstream.Stream
+			stderr httpstream.Stream
+			err    httpstream.Stream
+			resize httpstream.Stream
+		}
+		var streams streamSet
+		readyCh := make(chan struct{})
+
+		// kubelet decides which streams to open based on query parameters.
+		expected := 1 // error stream is always present
+		if q.Get("stdin") == "1" || q.Get("stdin") == "true" {
+			expected++
+		}
+		if q.Get("stdout") == "1" || q.Get("stdout") == "true" || q.Get("stdout") == "" {
+			expected++
+		}
+		if (q.Get("stderr") == "1" || q.Get("stderr") == "true" || q.Get("stderr") == "") &&
+			!(q.Get("tty") == "1" || q.Get("tty") == "true") {
+			expected++
+		}
+		if q.Get("resize") == "1" || q.Get("resize") == "true" {
+			expected++
+		}
+
+		got := 0
+		newStreamHandler := func(stream httpstream.Stream, replySent <-chan struct{}) error {
+			st := stream.Headers().Get("streamType")
+			log.Printf("SPDY new stream: id=%d streamType=%q headers=%v", stream.Identifier(), st, stream.Headers())
+			switch st {
+			case "stdin":
+				streams.stdin = stream
+			case "stdout":
+				streams.stdout = stream
+			case "stderr":
+				streams.stderr = stream
+			case "error":
+				streams.err = stream
+			case "resize":
+				streams.resize = stream
+			}
+			got++
+			if got >= expected {
+				select {
+				case <-readyCh:
+				default:
+					close(readyCh)
+				}
+			}
+			return nil
+		}
+
+		// 3. SPDY upgrade (returns 101 Switching Protocols)
+		upgrader := httpstreamspdy.NewResponseUpgrader()
+		conn := upgrader.UpgradeResponse(w, r, newStreamHandler)
+		if conn == nil {
+			log.Printf("SPDY upgrade failed: conn is nil")
+			return
+		}
+		defer conn.Close()
+
+		select {
+		case <-readyCh:
+		case <-time.After(10 * time.Second):
+			log.Printf("timeout waiting for SPDY streams (got=%d expected=%d)", got, expected)
+			return
+		case <-r.Context().Done():
+			return
+		}
+
+		// 4. execute command via helper
+		timeoutSec := 30
+		if t := q.Get("timeout"); t != "" {
+			// keep default if parse fails
+			if n, err := fmt.Sscanf(t, "%d", &timeoutSec); n == 1 && err == nil && timeoutSec <= 0 {
+				timeoutSec = 30
+			}
+		}
+		resp, execErr := execViaHelper(r.Context(), cmd, timeoutSec)
+
+		// 5. write stdout/stderr (append newline if missing)
+		if streams.stdout != nil && resp != nil && resp.Stdout != "" {
+			out := resp.Stdout
+			if !strings.HasSuffix(out, "\n") {
+				out += "\n"
+			}
+			_, _ = io.WriteString(streams.stdout, out)
+		}
+		if streams.stderr != nil && resp != nil && resp.Stderr != "" {
+			errOut := resp.Stderr
+			if !strings.HasSuffix(errOut, "\n") {
+				errOut += "\n"
+			}
+			_, _ = io.WriteString(streams.stderr, errOut)
+		}
+
+		// 6. write error stream with metav1.Status and exit code
+		if streams.err != nil {
+			exitCode := 0
+			errMsg := ""
+			if resp != nil {
+				exitCode = resp.ExitCode
+				errMsg = resp.Stderr
+			} else if execErr != nil {
+				exitCode = 1
+				errMsg = execErr.Error()
+			}
+
+			enc := json.NewEncoder(streams.err)
+			if exitCode == 0 {
+				_ = enc.Encode(&metav1.Status{Status: metav1.StatusSuccess})
+			} else {
+				_ = enc.Encode(&metav1.Status{
+					Status:  metav1.StatusFailure,
+					Reason:  apiremotecommand.NonZeroExitCodeReason,
+					Message: errMsg,
+					Details: &metav1.StatusDetails{
+						Causes: []metav1.StatusCause{
+							{
+								Type:    apiremotecommand.ExitCodeCauseType,
+								Message: fmt.Sprintf("%d", exitCode),
+							},
+						},
+					},
+				})
+			}
+		}
+
+		log.Printf("SPDY exec finished")
+		return
 	}
 
-	ctx := exec.CommandContext(r.Context(), helperPath, "--stream")
-	
-	// create pipe to write to helper stdin
-	helperStdin, err := ctx.StdinPipe()
+	// Non-upgrade HTTP request (e.g. curl for debugging): run once and return plain text.
+	log.Printf("Non-upgrade HTTP request, running command once")
+	resp, err := execViaHelper(r.Context(), cmd, 30)
 	if err != nil {
-		log.Printf("Failed to create stdin pipe: %v", err)
-		http.Error(w, fmt.Sprintf("failed to create stdin pipe: %v", err), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	ctx.Stdout = w
-	ctx.Stderr = w
-
-	// set response headers (kubelet may need specific Content-Type)
-	w.Header().Set("Content-Type", "application/vnd.kubernetes.protobuf")
-	w.Header().Set("X-Stream-Protocol-Version", "v4.channel.k8s.io")
-
-	// send initial command (JSON)
-	initReq := helperRequest{
-		Cmd:        cmd,
-		TimeoutSec: 0, // streaming mode has no timeout
+	if resp.Stdout != "" {
+		out := resp.Stdout
+		if !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		_, _ = io.WriteString(w, out)
 	}
-	initReqJSON, _ := json.Marshal(initReq)
-	initReqJSON = append(initReqJSON, '\n')
-
-	// start helper
-	if err := ctx.Start(); err != nil {
-		log.Printf("Failed to start helper: %v", err)
-		helperStdin.Close()
-		http.Error(w, fmt.Sprintf("failed to start helper: %v", err), http.StatusInternalServerError)
-		return
+	if resp.Stderr != "" {
+		errOut := resp.Stderr
+		if !strings.HasSuffix(errOut, "\n") {
+			errOut += "\n"
+		}
+		_, _ = io.WriteString(w, errOut)
 	}
-
-	// send initial command to helper stdin
-	if _, err := helperStdin.Write(initReqJSON); err != nil {
-		log.Printf("Failed to write initial command: %v", err)
-		ctx.Process.Kill()
-		helperStdin.Close()
-		return
-	}
-
-	// start goroutine to forward r.Body to helper stdin
-	go func() {
-		defer helperStdin.Close()
-		io.Copy(helperStdin, r.Body)
-	}()
-
-	// wait for helper to finish (will block until stream ends)
-	if err := ctx.Wait(); err != nil {
-		log.Printf(" Helper exited with error: %v", err)
-		// don't return error, it may be normal exit
-	}
-
-	log.Printf(" Exec stream finished")
+	log.Printf("Non-upgrade exec finished")
 }
 
